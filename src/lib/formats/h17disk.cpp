@@ -18,32 +18,20 @@ Heath H17D disk image format (version 2.0.0)
 
 #include "ioprocs.h"
 
+#include <algorithm>
 #include <cstring>
 
 
 namespace {
 
-constexpr int TRACK_SIZE           = 50'000;
-constexpr int BITCELL_SIZE         = 4000;
+using heath_h17::SECTORS_PER_TRACK;
+using heath_h17::SECTOR_DATA_SIZE;
+using heath_h17::format;
+using heath_h17::format_size;
+using heath_h17::formats;
+using heath_h17::sector_index;
 
 constexpr int SECTOR_METADATA_SIZE = 16;
-
-constexpr int SECTOR_DATA_SIZE     = 256;
-constexpr int SECTORS_PER_TRACK    = 10;
-
-struct format {
-	int      head_count;
-	int      track_count;
-	uint32_t variant;
-};
-
-const format formats[] = {
-	{ 1, 40, floppy_image::SSSD10 }, // H-17-1
-	{ 2, 40, floppy_image::DSSD10 },
-	{ 1, 80, floppy_image::SSQD10 },
-	{ 2, 80, floppy_image::DSQD10 }, // H-17-4
-	{}
-};
 
 struct block_header {
 	uint32_t block_name;
@@ -128,7 +116,7 @@ format find_format(util::random_read &io)
 } // anonymous namespace
 
 
-heath_h17d_format::heath_h17d_format() : floppy_image_format_t()
+heath_h17d_format::heath_h17d_format() : heath_h17_format()
 {
 }
 
@@ -162,14 +150,13 @@ bool heath_h17d_format::load(util::random_read &io, uint32_t form_factor, const 
 		return false;
 	}
 
-	image.set_variant(fmt.variant);
-
-	std::vector<uint32_t> buf;
-
 	auto const [secm_pos, secm_length] = find_block(io, SecM);
 
+	// the sector data, in sector_index() order; sectors points into it
+	std::vector<uint8_t> img(format_size(fmt));
+	std::vector<heath_h17::sector_fields> sectors(img.size() / SECTOR_DATA_SIZE);
+
 	uint8_t sector_meta_data[SECTOR_METADATA_SIZE];
-	uint8_t sector_data[SECTOR_DATA_SIZE];
 
 	for (int head = 0; head < fmt.head_count; head++)
 	{
@@ -177,7 +164,8 @@ bool heath_h17d_format::load(util::random_read &io, uint32_t form_factor, const 
 		{
 			for (int sector = 0; sector < SECTORS_PER_TRACK; sector++)
 			{
-				int sect_meta_pos = (sector + (track * fmt.head_count + head) * SECTORS_PER_TRACK) * SECTOR_METADATA_SIZE + secm_pos;
+				int const index = sector_index(fmt, head, track, sector);
+				int sect_meta_pos = index * SECTOR_METADATA_SIZE + secm_pos;
 
 				auto const [err, actual] = read_at(io, sect_meta_pos, sector_meta_data, SECTOR_METADATA_SIZE);
 
@@ -189,6 +177,7 @@ bool heath_h17d_format::load(util::random_read &io, uint32_t form_factor, const 
 				}
 				int data_offset = sector_meta_data[0] << 24 | sector_meta_data[1] << 16 | sector_meta_data[2] << 8 | sector_meta_data[3];
 
+				uint8_t *const sector_data = &img[size_t(index) * SECTOR_DATA_SIZE];
 				auto const [err2, actual2] = read_at(io, data_offset, sector_data, SECTOR_DATA_SIZE);
 
 				if (err2 || (actual2 != SECTOR_DATA_SIZE))
@@ -198,56 +187,19 @@ bool heath_h17d_format::load(util::random_read &io, uint32_t form_factor, const 
 					return false;
 				}
 
-				// Inital 15 zero bytes
-				for (int i = 0; i < 15; i++)
-				{
-					fm_reverse_byte_w(buf, 0);
-				}
+				// SecM bytes 5-9 are the header (sync, volume, track, sector,
+				// checksum), byte 10 the data sync and byte 11 the data checksum
+				heath_h17::sector_fields &fields = sectors[index];
 
-				// header (sync byte, volume, track, sector, checksum)
-				for (int i = 0; i < 5; i++)
-				{
-					fm_reverse_byte_w(buf, sector_meta_data[5 + i]);
-				}
-
-				// 12 zero bytes
-				for (int i = 0; i < 12; i++)
-				{
-					fm_reverse_byte_w(buf, 0);
-				}
-
-				// data sync byte
-				fm_reverse_byte_w(buf, sector_meta_data[10]);
-
-				// sector data
-				for (int i = 0; i < 256; i++)
-				{
-					fm_reverse_byte_w(buf, sector_data[i]);
-				}
-
-				// sector data checksum
-				fm_reverse_byte_w(buf, sector_meta_data[11]);
-
-				// trailing zero's until the next sector hole usually ~ 30 characters.
-				while (buf.size() < TRACK_SIZE / SECTORS_PER_TRACK * (sector + 1))
-				{
-					fm_reverse_byte_w(buf, 0);
-				}
+				std::copy(&sector_meta_data[5], &sector_meta_data[10], fields.header.begin());
+				fields.data_sync     = sector_meta_data[10];
+				fields.data          = sector_data;
+				fields.data_checksum = sector_meta_data[11];
 			}
-
-			generate_track_from_levels(track, head, buf, 0, image);
-			buf.clear();
 		}
 	}
 
-	return true;
-}
-
-void heath_h17d_format::fm_reverse_byte_w(std::vector<uint32_t> &buffer, uint8_t val) const
-{
-	constexpr unsigned char lookup[16] = { 0x0, 0x8, 0x4, 0xc, 0x2, 0xa, 0x6, 0xe, 0x1, 0x9, 0x5, 0xd, 0x3, 0xb, 0x7, 0xf };
-
-	fm_w(buffer, 8, lookup[val & 0x0f] << 4 | lookup[val >> 4], BITCELL_SIZE);
+	return generate_tracks(image, fmt, sectors);
 }
 
 const heath_h17d_format FLOPPY_H17D_FORMAT;

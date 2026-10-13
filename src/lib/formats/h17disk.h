@@ -13,9 +13,9 @@ H17 controller on the H8 and the H-88-1 controller on the H89.
 
 #pragma once
 
-#include "flopimg.h"
+#include "h17_common.h"
 
-class heath_h17d_format : public floppy_image_format_t
+class heath_h17d_format : public heath_h17_format
 {
 public:
 	heath_h17d_format();
@@ -27,10 +27,6 @@ public:
 	const char *description() const noexcept override { return "Heath H17D disk image"; }
 	const char *extensions() const noexcept override { return "h17,h17d,h17disk"; }
 	bool supports_save() const noexcept override { return false; }
-
-protected:
-
-	void fm_reverse_byte_w(std::vector<uint32_t> &buffer, uint8_t val) const;
 };
 
 extern const heath_h17d_format FLOPPY_H17D_FORMAT;

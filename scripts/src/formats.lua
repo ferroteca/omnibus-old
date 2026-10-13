@@ -1155,6 +1155,18 @@ end
 
 --------------------------------------------------
 --
+--@src/lib/formats/h17_common.h,FORMATS["H17_COMMON"] = true
+--------------------------------------------------
+
+if opt_tool(FORMATS, "H17_COMMON") then
+	files {
+		MAME_DIR.. "src/lib/formats/h17_common.cpp",
+		MAME_DIR.. "src/lib/formats/h17_common.h",
+	}
+end
+
+--------------------------------------------------
+--
 --@src/lib/formats/h17disk.h,FORMATS["H17D_DSK"] = true
 --------------------------------------------------
 
@@ -1162,6 +1174,18 @@ if opt_tool(FORMATS, "H17D_DSK") then
 	files {
 		MAME_DIR.. "src/lib/formats/h17disk.cpp",
 		MAME_DIR.. "src/lib/formats/h17disk.h",
+	}
+end
+
+--------------------------------------------------
+--
+--@src/lib/formats/h8d_dsk.h,FORMATS["H8D_DSK"] = true
+--------------------------------------------------
+
+if opt_tool(FORMATS, "H8D_DSK") then
+	files {
+		MAME_DIR.. "src/lib/formats/h8d_dsk.cpp",
+		MAME_DIR.. "src/lib/formats/h8d_dsk.h",
 	}
 end
 

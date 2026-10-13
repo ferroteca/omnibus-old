@@ -17,6 +17,7 @@
 #include "h17_fdc_base.h"
 
 #include "formats/h17disk.h"
+#include "formats/h8d_dsk.h"
 
 
 #define LOG_REG   (1U << 1) // Register setup
@@ -386,6 +387,7 @@ TIMER_DEVICE_CALLBACK_MEMBER(heath_h17_fdc_base_device::tx_timer_cb)
 void heath_h17_fdc_base_device::floppy_formats(format_registration &fr)
 {
 	fr.add(FLOPPY_H17D_FORMAT);
+	fr.add(FLOPPY_H8D_FORMAT);
 }
 
 void heath_h17_fdc_base_device::device_add_mconfig(machine_config &config)
