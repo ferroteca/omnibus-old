@@ -280,10 +280,20 @@ TARGET := mame
 endif
 
 ifndef SUBTARGET
-SUBTARGET := $(TARGET)
+SUBTARGET := omnibus
 endif
 
 SUBTARGET_FULL := $(subst -,_,$(SUBTARGET))
+
+# the omnibus subtarget builds through its filter file so the binary is
+# named omnibus rather than mameomnibus (see mainProject in scripts/src/main.lua)
+ifeq ($(SUBTARGET_FULL),omnibus)
+ifndef SOURCES
+ifndef SOURCEFILTER
+SOURCEFILTER := src/mame/omnibus.flt
+endif
+endif
+endif
 
 
 CONFIG = release
