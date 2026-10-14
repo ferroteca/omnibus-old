@@ -23,12 +23,12 @@ def parse_args():
 
 
 def extract_version(verinfo):
-    pattern = re.compile(r'\s+BARE_BUILD_VERSION\s+"(([^."]+)\.([^."]+))"')
+    pattern = re.compile(r'\s+BARE_BUILD_VERSION\s+"((\d+)\.(\d+)(?:\.(\d+))?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"')
     for line in verinfo:
         match = pattern.search(line)
         if match:
-            return match.group(1), match.group(2), match.group(3)
-    return None, None, None
+            return match.group(1), match.group(2), match.group(3), match.group(4) or '0'
+    return None, None, None, None
 
 
 if __name__ == '__main__':
@@ -36,8 +36,7 @@ if __name__ == '__main__':
 
     try:
         with io.open(options.input, 'r') as verinfo:
-            verfull, vermajor, verminor = extract_version(verinfo)
-            verbuild = '0'
+            verfull, vermajor, verminor, verbuild = extract_version(verinfo)
     except IOError as e:
         sys.stderr.write("Error reading source file '%s': %s\n" % (options.input, e))
         sys.exit(1)
@@ -91,7 +90,7 @@ if __name__ == '__main__':
                 '\t\t\tVALUE "Comments", "${comments}\\0"\n' \
                 '\t\t\tVALUE "CompanyName", "${company}\\0"\n' \
                 '\t\t\tVALUE "FileDescription", "${filedesc}\\0"\n' \
-                '\t\t\tVALUE "FileVersion", "${major}, ${minor}, ${build}, ${subbuild}\\0"\n' \
+                '\t\t\tVALUE "FileVersion", "${version}\\0"\n' \
                 '\t\t\tVALUE "InternalName", "${internal}\\0"\n' \
                 '\t\t\tVALUE "LegalCopyright", "${copyright}\\0"\n' \
                 '\t\t\tVALUE "OriginalFilename", "${original}\\0"\n' \
@@ -113,17 +112,17 @@ if __name__ == '__main__':
     internal = options.target + '_' + options.subtarget if options.target != options.subtarget else options.target
     text = template.substitute(
             version=verfull,
-            major=vermajor, minor=verminor, build='0', subbuild='0',
+            major=vermajor, minor=verminor, build=verbuild, subbuild='0',
             author='MAMEdev and contributors',
             comments='Multi-purpose emulation framework',
             company='MAMEdev',
-            filedesc='MAME',
+            filedesc=('OMNIBUS' if options.subtarget == 'omnibus' else 'MAME'),
             internal=internal,
             original=options.executable,
-            product=('MAME' if options.target == 'mame' else options.target),
+            product=('OMNIBUS' if options.subtarget == 'omnibus' else ('MAME' if options.target == 'mame' else options.target)),
             rdns=('org.mamedev.' + internal),
             copyright='\u00a9 1997-2026 MAMEdev and contributors',
-            winfileflags=('0x0L' if verbuild == '0' else 'VS_FF_PRERELEASE'),
+            winfileflags=('VS_FF_PRERELEASE' if '-' in verfull.split('+', 1)[0] else '0x0L'),
             resources=(options.resources or 'mame.rc'))
 
     if options.o is not None:

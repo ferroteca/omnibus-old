@@ -11,8 +11,8 @@
 #include "emu.h"
 #include "main.h"
 
-#define APPNAME                 "MAME"
-#define APPNAME_LOWER           "mame"
+#define APPNAME                 "OMNIBUS"
+#define APPNAME_LOWER           "omnibus"
 #define CONFIGNAME              "mame"
 #define COPYRIGHT               "Copyright MAMEdev and contributors\nhttps://mamedev.org"
 #define COPYRIGHT_INFO          "Copyright MAMEdev and contributors"
