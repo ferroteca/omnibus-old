@@ -22,11 +22,12 @@ public:
 
 	int identify(util::random_read &io, uint32_t form_factor, const std::vector<uint32_t> &variants) const override;
 	bool load(util::random_read &io, uint32_t form_factor, const std::vector<uint32_t> &variants, floppy_image &image) const override;
+	bool save(util::random_read_write &io, const std::vector<uint32_t> &variants, const floppy_image &image) const override;
 
 	const char *name() const noexcept override { return "h17disk"; }
 	const char *description() const noexcept override { return "Heath H17D disk image"; }
 	const char *extensions() const noexcept override { return "h17,h17d,h17disk"; }
-	bool supports_save() const noexcept override { return false; }
+	bool supports_save() const noexcept override { return true; }
 };
 
 extern const heath_h17d_format FLOPPY_H17D_FORMAT;

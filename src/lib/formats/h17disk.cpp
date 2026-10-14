@@ -8,8 +8,6 @@ Heath H17D disk image format (version 2.0.0)
 
    See https://heathkit.garlanger.com/diskformats/ for more information
 
-   TODO - implement writing to H17D image
-
 *********************************************************************/
 
 #include "h17disk.h"
@@ -19,11 +17,14 @@ Heath H17D disk image format (version 2.0.0)
 #include "ioprocs.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <vector>
 
 
 namespace {
 
+using heath_h17::H17_SYNC_BYTE;
 using heath_h17::SECTORS_PER_TRACK;
 using heath_h17::SECTOR_DATA_SIZE;
 using heath_h17::format;
@@ -113,6 +114,54 @@ format find_format(util::random_read &io)
 	return {};
 }
 
+// Block lengths are big-endian; block names are the four characters in file
+// order, which is how the enum above spells them.
+void put_be32(uint8_t *data, uint32_t val)
+{
+	data[0] = val >> 24;
+	data[1] = val >> 16;
+	data[2] = val >> 8;
+	data[3] = val;
+}
+
+void put_block_name(uint8_t *data, uint32_t val)
+{
+	data[0] = val;
+	data[1] = val >> 8;
+	data[2] = val >> 16;
+	data[3] = val >> 24;
+}
+
+bool write_exact(util::random_read_write &io, uint64_t offset, void const *data, size_t length)
+{
+	auto const [err, actual] = write_at(io, offset, data, length);
+
+	return !err && (actual == length);
+}
+
+// Writes one block, header and data, at offset, and moves offset past it.
+bool write_block(util::random_read_write &io, uint64_t &offset, uint32_t block_name, void const *data, uint32_t length)
+{
+	uint8_t header[8];
+	put_block_name(header, block_name);
+	put_be32(&header[4], length);
+
+	if (!write_exact(io, offset, header, sizeof(header)))
+	{
+		return false;
+	}
+
+	offset += sizeof(header);
+
+	if (length && !write_exact(io, offset, data, length))
+	{
+		return false;
+	}
+
+	offset += length;
+	return true;
+}
+
 } // anonymous namespace
 
 
@@ -200,6 +249,85 @@ bool heath_h17d_format::load(util::random_read &io, uint32_t form_factor, const 
 	}
 
 	return generate_tracks(image, fmt, sectors);
+}
+
+// Writes a version 2 file: the header, a DskF block, a Padd block that puts
+// the H8DB data at offset 256, the H8DB block and a SecM block.
+bool heath_h17d_format::save(util::random_read_write &io, const std::vector<uint32_t> &variants, const floppy_image &image) const
+{
+	format const fmt = heath_h17::find_format(image);
+
+	if (!fmt.head_count)
+	{
+		LOG_FORMATS("no H17D layout holds this image\n");
+
+		return false;
+	}
+
+	size_t const sector_count = size_t(fmt.head_count) * fmt.track_count * SECTORS_PER_TRACK;
+	std::vector<uint8_t> h8db(sector_count * SECTOR_DATA_SIZE);
+	std::vector<uint8_t> secm(sector_count * SECTOR_METADATA_SIZE);
+
+	std::vector<heath_h17::sector_read> const sectors = read_sectors(image, fmt);
+
+	for (size_t index = 0; index < sector_count; index++)
+	{
+		heath_h17::sector_read const &found = sectors[index];
+		std::array<uint8_t, SECTOR_METADATA_SIZE> metadata;
+
+		metadata.fill(0);
+
+		uint32_t const data_offset = 256 + uint32_t(index * SECTOR_DATA_SIZE);
+		put_be32(metadata.data(), data_offset);
+
+		// A sector that would not decode is saved as zeros with an empty SecM
+		// entry.  The file is already truncated when save() runs, so failing
+		// here would leave it empty.
+		if (found.found)
+		{
+			metadata[5]  = H17_SYNC_BYTE;
+			metadata[6]  = found.volume;
+			metadata[7]  = found.track;
+			metadata[8]  = found.sector;
+			metadata[9]  = found.header_checksum;
+			metadata[10] = H17_SYNC_BYTE;
+			metadata[11] = found.data_checksum;
+			metadata[12] = 1;
+
+			std::copy(found.data.begin(), found.data.end(), h8db.begin() + (index * SECTOR_DATA_SIZE));
+		}
+
+		std::copy(metadata.begin(), metadata.end(), secm.begin() + (index * SECTOR_METADATA_SIZE));
+	}
+
+	uint8_t const header[8] = { 'H', '1', '7', 'D', '2', '0', '0', 0xff };
+
+	if (!write_exact(io, 0, header, sizeof(header)))
+	{
+		return false;
+	}
+
+	uint64_t offset = sizeof(header);
+	uint8_t dskf[3] = { uint8_t(fmt.head_count), uint8_t(fmt.track_count), 0 };
+
+	if (!write_block(io, offset, DskF, dskf, sizeof(dskf)))
+	{
+		return false;
+	}
+
+	std::vector<uint8_t> padding(248 - offset - 8, 0);
+
+	if (!write_block(io, offset, Padd, padding.data(), uint32_t(padding.size())))
+	{
+		return false;
+	}
+
+	if (!write_block(io, offset, H8DB, h8db.data(), uint32_t(h8db.size())))
+	{
+		return false;
+	}
+
+	return write_block(io, offset, SecM, secm.data(), uint32_t(secm.size()));
 }
 
 const heath_h17d_format FLOPPY_H17D_FORMAT;

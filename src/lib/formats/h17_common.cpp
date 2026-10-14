@@ -43,6 +43,57 @@ int sector_index(format const &fmt, int head, int track, int sector)
 	return ((track * fmt.head_count) + head) * SECTORS_PER_TRACK + sector;
 }
 
+format find_format(floppy_image const &image)
+{
+	int tracks, heads;
+	image.get_actual_geometry(tracks, heads);
+
+	if (!tracks)
+	{
+		switch (image.get_variant())
+		{
+		case floppy_image::SSSD:
+		case floppy_image::SSDD:
+		case floppy_image::SSSD10:
+		case floppy_image::SSDD10:
+			heads = 1;
+			tracks = 40;
+			break;
+		case floppy_image::DSSD:
+		case floppy_image::DSDD:
+		case floppy_image::DSSD10:
+		case floppy_image::DSDD10:
+			heads = 2;
+			tracks = 40;
+			break;
+		case floppy_image::SSQD:
+		case floppy_image::SSQD10:
+			heads = 1;
+			tracks = 80;
+			break;
+		case floppy_image::DSQD:
+		case floppy_image::DSQD10:
+			heads = 2;
+			tracks = 80;
+			break;
+		default:
+			heads = 0;
+			tracks = 0;
+			break;
+		}
+	}
+
+	for (int i = 0; formats[i].head_count; i++)
+	{
+		if ((formats[i].head_count >= heads) && (formats[i].track_count >= tracks))
+		{
+			return formats[i];
+		}
+	}
+
+	return {};
+}
+
 // D = RLCA(byte XOR D) per byte.  The sync byte resets D to 0 before the
 // header or data bytes, so it is not part of the sum.
 uint8_t h17_checksum(uint8_t const *data, size_t length)
@@ -118,6 +169,131 @@ uint8_t reverse_byte(uint8_t val)
 	return lookup[val & 0x0f] << 4 | lookup[val >> 4];
 }
 
+bool fm_byte_from_bitstream(std::vector<bool> const &bitstream, size_t pos, uint8_t &val)
+{
+	if ((pos + 16) > bitstream.size())
+	{
+		return false;
+	}
+
+	uint8_t result = 0;
+
+	for (int i = 0; i < 8; i++)
+	{
+		result = (result << 1) | (bitstream[pos + (i * 2) + 1] ? 1 : 0);
+	}
+
+	val = reverse_byte(result);
+
+	return true;
+}
+
+void decode_track(std::vector<bool> const &bitstream, std::array<sector_read, SECTORS_PER_TRACK> &sectors)
+{
+	sectors.fill(sector_read());
+
+	size_t const size = bitstream.size();
+
+	if (size < 16)
+	{
+		return;
+	}
+
+	// two copies of the track end to end, so a sector that crosses the index
+	// reads in one piece
+	std::vector<bool> track(bitstream);
+	track.insert(track.end(), bitstream.begin(), bitstream.end());
+
+	for (size_t pos = 0; pos < size; pos++)
+	{
+		uint8_t val;
+
+		if (!fm_byte_from_bitstream(track, pos, val) || (val != H17_SYNC_BYTE))
+		{
+			continue;
+		}
+
+		// header: volume, track, sector, checksum
+		uint8_t header[4];
+		size_t next = pos + 16;
+		bool complete = true;
+
+		for (uint8_t &b : header)
+		{
+			if (!fm_byte_from_bitstream(track, next, b))
+			{
+				complete = false;
+				break;
+			}
+
+			next += 16;
+		}
+
+		int const sector = header[2];
+
+		if (!complete || (sector >= SECTORS_PER_TRACK) || (h17_checksum(header, 3) != header[3]) || sectors[sector].data_valid)
+		{
+			continue;
+		}
+
+		size_t const search_end = next + (size_t(MAX_HEADER_TO_DATA_BYTES) * 16);
+
+		for (size_t sync_pos = next; sync_pos < search_end; sync_pos++)
+		{
+			if (!fm_byte_from_bitstream(track, sync_pos, val))
+			{
+				break;
+			}
+
+			if (val != H17_SYNC_BYTE)
+			{
+				continue;
+			}
+
+			size_t data_pos = sync_pos + 16;
+
+			std::array<uint8_t, SECTOR_DATA_SIZE> data;
+			complete = true;
+
+			for (uint8_t &b : data)
+			{
+				if (!fm_byte_from_bitstream(track, data_pos, b))
+				{
+					complete = false;
+					break;
+				}
+
+				data_pos += 16;
+			}
+
+			uint8_t checksum;
+
+			if (!complete || !fm_byte_from_bitstream(track, data_pos, checksum))
+			{
+				break;
+			}
+
+			bool const valid = h17_checksum(data.data(), data.size()) == checksum;
+
+			if (!sectors[sector].found || valid)
+			{
+				sector_read &out = sectors[sector];
+
+				out.found           = true;
+				out.data_valid      = valid;
+				out.volume          = header[0];
+				out.track           = header[1];
+				out.sector          = header[2];
+				out.header_checksum = header[3];
+				out.data_checksum   = checksum;
+				out.data            = data;
+			}
+
+			break;
+		}
+	}
+}
+
 sector_fields make_sector(format const &fmt, std::vector<uint8_t> const &img, int head, int track, int sector,
 		bool hdos, uint8_t lab_ser)
 {
@@ -173,6 +349,36 @@ bool heath_h17_format::generate_tracks(floppy_image &image, heath_h17::format co
 	}
 
 	return true;
+}
+
+std::vector<heath_h17::sector_read> heath_h17_format::read_sectors(floppy_image const &image, heath_h17::format const &fmt) const
+{
+	std::vector<heath_h17::sector_read> result(format_size(fmt) / heath_h17::SECTOR_DATA_SIZE);
+	std::array<heath_h17::sector_read, heath_h17::SECTORS_PER_TRACK> sectors;
+
+	for (int head = 0; head < fmt.head_count; head++)
+	{
+		for (int track = 0; track < fmt.track_count; track++)
+		{
+			heath_h17::decode_track(generate_bitstream_from_track(track, head, heath_h17::BITCELL_SIZE, image), sectors);
+
+			for (int sector = 0; sector < heath_h17::SECTORS_PER_TRACK; sector++)
+			{
+				if (!sectors[sector].found)
+				{
+					LOG_FORMATS("unable to decode H17 sector %d/%d/%d\n", head, track, sector);
+				}
+				else if (!sectors[sector].data_valid)
+				{
+					LOG_FORMATS("bad data checksum on H17 sector %d/%d/%d\n", head, track, sector);
+				}
+
+				result[heath_h17::sector_index(fmt, head, track, sector)] = sectors[sector];
+			}
+		}
+	}
+
+	return result;
 }
 
 

@@ -76,7 +76,9 @@ struct format {
 };
 
 // The order matters.  find_format() in h8d_dsk.cpp takes the first layout of
-// the right file size, and DSSD and SSQD are both 200K.
+// the right file size, and DSSD and SSQD are both 200K.  find_format() below
+// takes the first layout that holds the image, so the list runs from smallest
+// to largest.
 inline constexpr format formats[] = {
 	{ 1, 40, floppy_image::SSSD10, floppy_image::SSSD }, // H-17-1
 	{ 2, 40, floppy_image::DSSD10, floppy_image::DSSD },
@@ -95,6 +97,23 @@ bool is_compatible(format const &fmt, std::vector<uint32_t> const &variants);
 // Returns where a sector sits in an image's data: the sides are interleaved
 // one track at a time, so track 0 head 0 comes first, then track 0 head 1.
 int sector_index(format const &fmt, int head, int track, int sector);
+
+
+// Returns the layout save() writes an image as: the smallest layout that
+// holds every formatted track.
+//
+// A blank image must still get a layout.  floppy_image_device::commit_image()
+// truncates the file before it calls save() and ignores the result.  If
+// save() returns false, the file is left with 0 bytes, and no format will
+// identify it the next time it is mounted.  This returns no layout only for an
+// image with more heads or tracks than the largest layout.
+//
+// A blank image has no formatted tracks, so its layout comes from the variant
+// that unformatted_image::format() set when the image was created.  The H17
+// controller writes single density on any media, so a double density variant
+// gets the single density layout with the same heads and tracks.  A blank
+// image with no variant gets the smallest layout.
+format find_format(floppy_image const &image);
 
 
 // H17 checksum over a run of bytes, as the ROM's RDB/WNB routines compute it.
@@ -119,6 +138,51 @@ bool is_hdos(std::vector<uint8_t> const &img, uint8_t &lab_ser);
 // Reverses the bit order of a byte.  The disk records each byte least
 // significant bit first.
 uint8_t reverse_byte(uint8_t val);
+
+
+// Decodes one FM byte from a bitstream, starting at half-cell pos.  The data
+// half-cells are the odd entries.
+bool fm_byte_from_bitstream(std::vector<bool> const &bitstream, size_t pos, uint8_t &val);
+
+
+// How many bytes after a sector header decode_track() searches for the data
+// sync byte.  When the emulated machine rewrites a sector, it writes only the
+// data field.  The write starts wherever the head is after the machine reads
+// the header and turns on the write gate, so the gap before the data can
+// differ from the 12 zero bytes write_sector() writes.  A sector is 320 bytes
+// and the data field uses 258 of them, so a gap longer than this cannot fit.
+constexpr int MAX_HEADER_TO_DATA_BYTES = 54;
+
+
+// One sector as found on a track.
+struct sector_read
+{
+	bool    found           = false;  // a header, and a data field to go with it
+	bool    data_valid      = false;  // the data checksum matched
+	uint8_t volume          = 0;
+	uint8_t track           = 0;
+	uint8_t sector          = 0;
+	uint8_t header_checksum = 0;
+	uint8_t data_checksum   = 0;
+
+	std::array<uint8_t, SECTOR_DATA_SIZE> data{};
+};
+
+
+// Reads every sector on a track.  It finds each sector by its header, not by
+// its position.  A sector the emulated machine rewrote starts wherever the
+// head was, can shift the sectors after it, and can cross the index hole.  So
+// the search covers the whole track and continues past the index.
+//
+// The data field is searched one bit at a time, not one byte at a time.  A
+// rewritten data field need not line up on the same bit boundary as the
+// header before it.
+//
+// Both checksums must match, so a sync byte inside sector data is not taken
+// for the start of a sector.  A sector with a bad data checksum is still
+// returned, because a real disk can hold one, and dropping it would silently
+// replace its data with zeros.  A later copy with a good checksum replaces it.
+void decode_track(std::vector<bool> const &bitstream, std::array<sector_read, SECTORS_PER_TRACK> &sectors);
 
 
 // The fields of one sector, as heath_h17_format::generate_tracks() writes
@@ -160,6 +224,11 @@ protected:
 	// disk would be written past the end of the array.
 	bool generate_tracks(floppy_image &image, heath_h17::format const &fmt,
 			std::vector<heath_h17::sector_fields> const &sectors) const;
+
+	// Decodes every track of image and returns one entry per sector, in
+	// sector_index() order.  An entry whose found is false is a sector that
+	// would not decode; the caller saves it as zeros.
+	std::vector<heath_h17::sector_read> read_sectors(floppy_image const &image, heath_h17::format const &fmt) const;
 
 private:
 	// Writes one byte to a track buffer as FM, least significant bit first.

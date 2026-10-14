@@ -17,6 +17,7 @@ See https://sebhc.github.io/sebhc/h8d.html for the raw sector layout.
 
 #include "ioprocs.h"
 
+#include <algorithm>
 #include <vector>
 
 
@@ -122,6 +123,32 @@ bool heath_h8d_format::load(util::random_read &io, uint32_t form_factor, const s
 	}
 
 	return generate_tracks(image, fmt, sectors);
+}
+
+bool heath_h8d_format::save(util::random_read_write &io, const std::vector<uint32_t> &variants, const floppy_image &image) const
+{
+	format const fmt = heath_h17::find_format(image);
+
+	if (!fmt.head_count)
+	{
+		LOG_FORMATS("H8D save: no layout holds this image\n");
+		return false;
+	}
+
+	std::vector<uint8_t> img(format_size(fmt), 0);
+	std::vector<heath_h17::sector_read> const sectors = read_sectors(image, fmt);
+
+	// a sector that would not decode keeps the zeros img starts with
+	for (size_t index = 0; index < sectors.size(); index++)
+	{
+		if (sectors[index].found)
+		{
+			std::copy(sectors[index].data.begin(), sectors[index].data.end(), &img[index * SECTOR_DATA_SIZE]);
+		}
+	}
+
+	auto const [err, actual] = write_at(io, 0, img.data(), img.size());
+	return !err && (actual == img.size());
 }
 
 const heath_h8d_format FLOPPY_H8D_FORMAT;

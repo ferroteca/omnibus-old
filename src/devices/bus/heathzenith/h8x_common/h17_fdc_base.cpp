@@ -8,9 +8,6 @@
     The bus attachments are h89/h17_fdc.cpp (H-88-1) and h8/h_8_17.cpp
     (H-8-17).
 
-  TODO
-    - writing to disk images
-
 ****************************************************************************/
 
 #include "emu.h"
@@ -83,6 +80,8 @@ void heath_h17_fdc_base_device::set_floppy(floppy_image_device *floppy)
 
 	LOGDRIVE("%s: selecting new drive\n", FUNCNAME);
 
+	stop_tx_write();
+
 	m_floppy = floppy;
 
 	// set any latched signals
@@ -92,6 +91,7 @@ void heath_h17_fdc_base_device::set_floppy(floppy_image_device *floppy)
 	}
 
 	reset_rx_separator();
+	start_tx_write();
 }
 
 void heath_h17_fdc_base_device::side_select_w(int state)
@@ -100,8 +100,10 @@ void heath_h17_fdc_base_device::side_select_w(int state)
 
 	if (m_floppy)
 	{
+		stop_tx_write();
 		m_floppy->ss_w(m_side);
 		reset_rx_separator();
+		start_tx_write();
 	}
 }
 
@@ -121,8 +123,10 @@ void heath_h17_fdc_base_device::step_w(int state)
 	{
 		LOGFUNC("%s: step: 0x%02x\n", FUNCNAME, state);
 
+		stop_tx_write();
 		m_floppy->stp_w(state);
 		reset_rx_separator();
+		start_tx_write();
 	}
 }
 
@@ -131,6 +135,11 @@ void heath_h17_fdc_base_device::set_motor(bool motor_on)
 	if (m_motor_on == motor_on)
 	{
 		return;
+	}
+
+	if (!motor_on)
+	{
+		stop_tx_write();
 	}
 
 	m_motor_on = motor_on;
@@ -147,6 +156,7 @@ void heath_h17_fdc_base_device::set_motor(bool motor_on)
 	}
 
 	reset_rx_separator();
+	start_tx_write();
 }
 
 // Receive data separator.  The board has no PLL, so the cell rate is fixed and
@@ -156,7 +166,9 @@ void heath_h17_fdc_base_device::set_motor(bool motor_on)
 
 void heath_h17_fdc_base_device::schedule_rx_cell()
 {
-	if (!m_motor_on || !m_floppy)
+	// The separator idles while the board is writing: it must not decode the
+	// flux the board itself is laying down.
+	if (!m_motor_on || !m_floppy || m_tx_write_active)
 	{
 		m_rx_timer->adjust(attotime::never);
 		return;
@@ -193,7 +205,7 @@ void heath_h17_fdc_base_device::rx_emit_cell()
 
 TIMER_CALLBACK_MEMBER(heath_h17_fdc_base_device::rx_timer_cb)
 {
-	if (!m_motor_on || !m_floppy)
+	if (!m_motor_on || !m_floppy || m_tx_write_active)
 	{
 		m_rx_timer->adjust(attotime::never);
 		return;
@@ -253,7 +265,7 @@ TIMER_CALLBACK_MEMBER(heath_h17_fdc_base_device::rx_timer_cb)
 
 void heath_h17_fdc_base_device::ctrl_w(u8 val)
 {
-	m_write_gate = bool(BIT(val, CTRL_WRITE_GATE));
+	set_write_gate(bool(BIT(val, CTRL_WRITE_GATE)));
 
 	set_motor(bool(BIT(val, CTRL_MOTOR_ON)));
 
@@ -349,6 +361,8 @@ void heath_h17_fdc_base_device::device_start()
 
 	save_item(NAME(m_motor_on));
 	save_item(NAME(m_write_gate));
+	save_item(NAME(m_tx_write_active));
+	save_item(NAME(m_tx_last_commit));
 	save_item(NAME(m_sync_char_received));
 	save_item(NAME(m_rx_cell_start));
 	save_item(NAME(m_rx_scan));
@@ -362,10 +376,14 @@ void heath_h17_fdc_base_device::device_reset()
 {
 	m_motor_on           = false;
 	m_write_gate         = false;
+	m_tx_write_active    = false;
 	m_sync_char_received = false;
+	m_tx_last_commit     = attotime::zero;
 
 	m_tx_timer->adjust(attotime::from_hz(USRT_TX_CLOCK), 0, attotime::from_hz(USRT_TX_CLOCK));
 	reset_rx_separator();
+	m_tx_pll.set_clock(fm_cell_time());
+	m_tx_pll.reset(machine().time());
 }
 
 static void h17_floppies(device_slot_interface &device)
@@ -384,6 +402,104 @@ TIMER_DEVICE_CALLBACK_MEMBER(heath_h17_fdc_base_device::tx_timer_cb)
 	m_s2350->tcp_w();
 }
 
+// Write path.  The USRT shifts each data bit out through tx_w(), and the board
+// records it on the disk as one FM bit cell: a clock half-cell followed by a
+// data half-cell.  fdc_pll_t is used only as a write clock here; nothing is
+// being tracked.
+//
+// A write runs from the write gate going on to its going off, as long as the
+// motor is on and a drive is selected.  Each change of drive, side, track or
+// motor state ends the write in progress and starts a new one, so that every
+// flux span handed to floppy_image_device belongs to one track.
+
+void heath_h17_fdc_base_device::set_write_gate(bool write_gate)
+{
+	if (m_write_gate == write_gate)
+	{
+		return;
+	}
+
+	if (!write_gate)
+	{
+		stop_tx_write();
+	}
+
+	m_write_gate = write_gate;
+
+	if (write_gate)
+	{
+		start_tx_write();
+	}
+	else
+	{
+		// The read separator was idle during the write.  Re-anchor it at the
+		// current head position, as a seek or a drive change does.  HDOS reads
+		// each sector back right after writing it, and without this that read
+		// starts from a stale position, mis-syncs, and INIT fails with "UNABLE
+		// TO READ/WRITE THIS DISKETTE".
+		reset_rx_separator();
+	}
+}
+
+void heath_h17_fdc_base_device::start_tx_write()
+{
+	if (m_tx_write_active || !m_write_gate || !m_motor_on || !m_floppy)
+	{
+		return;
+	}
+
+	m_tx_pll.set_clock(fm_cell_time());
+	m_tx_pll.reset(machine().time());
+	m_tx_pll.start_writing(machine().time(), m_floppy);
+	m_tx_write_active = true;
+	m_tx_last_commit  = m_tx_pll.ctime;
+}
+
+void heath_h17_fdc_base_device::stop_tx_write()
+{
+	if (!m_tx_write_active)
+	{
+		return;
+	}
+
+	m_tx_pll.stop_writing(m_floppy, m_tx_pll.ctime);
+	m_tx_write_active = false;
+}
+
+void heath_h17_fdc_base_device::write_tx_cell(bool bit)
+{
+	attotime tm;
+	m_tx_pll.write_next_bit(bit, tm, m_floppy, m_tx_pll.ctime + fm_cell_time());
+}
+
+void heath_h17_fdc_base_device::tx_w(int state)
+{
+	if (!m_tx_write_active)
+	{
+		return;
+	}
+
+	write_tx_cell(true);
+	write_tx_cell(BIT(state, 0));
+
+	// Flush the write to the image every tx_commit_interval(), so that no
+	// single flush covers more than one revolution.
+	//
+	// floppy_image_device stores a write as one span of angles on the track,
+	// so it cannot hold a write that ran longer than a revolution: every time
+	// is folded onto the same 200ms, and the flux lands out of order in the
+	// track buffer.  HDOS INIT holds the write gate on for about 360ms on its
+	// first pass over a track.  That corrupted the two sectors either side of
+	// the index hole and left the volume label at track 0 sector 9 unreadable.
+	//
+	// wd_fdc and upd765 commit as they go for the same reason.
+	if ((m_tx_pll.ctime - m_tx_last_commit) >= tx_commit_interval())
+	{
+		m_tx_pll.commit(m_floppy, m_tx_pll.ctime);
+		m_tx_last_commit = m_tx_pll.ctime;
+	}
+}
+
 void heath_h17_fdc_base_device::floppy_formats(format_registration &fr)
 {
 	fr.add(FLOPPY_H17D_FORMAT);
@@ -393,11 +509,16 @@ void heath_h17_fdc_base_device::floppy_formats(format_registration &fr)
 void heath_h17_fdc_base_device::device_add_mconfig(machine_config &config)
 {
 	S2350(config, m_s2350);
+	m_s2350->tx_handler().set(FUNC(heath_h17_fdc_base_device::tx_w));
 	m_s2350->sync_character_received_cb().set(FUNC(heath_h17_fdc_base_device::sync_character_received));
 
 	for (int i = 0; i < MAX_FLOPPY_DRIVES; i++)
 	{
 		FLOPPY_CONNECTOR(config, m_floppies[i], h17_floppies, "ssdd", heath_h17_fdc_base_device::floppy_formats);
+		// A blank disk created in the drive takes its variant from the drive,
+		// and only the hard-sectored variants give the ten sector holes INIT
+		// needs to format it.
+		m_floppies[i]->set_sectoring_type(floppy_image::H10);
 		m_floppies[i]->enable_sound(true);
 	}
 
